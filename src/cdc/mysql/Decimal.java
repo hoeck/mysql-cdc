@@ -45,35 +45,40 @@ public class Decimal {
     static void throwf(String msg) {
         throw new RuntimeException(msg);
     }
-    
 
     // helpers for integer packing, see myisampack.h
     // "Storing of values in high byte first order." (for better compression)
+    // the original macros expect an unsigned byte-array
+
+    public static int ubyte(byte a) {
+        // returns the bytes value as an int as if it were an unsigned byte
+        return a & ((int) 0xff);
+    }
 
     public static int mi_sint1korr(byte[] a) {
-        return a[0];
+        return ubyte(a[0]);
     }
 
     public static int mi_sint2korr(byte[] a) {
-        return ((int)((short) (a[1] + (a[0] << 8)))); // was originally an int16
+        return ((int) (ubyte(a[1]) + (ubyte(a[0]) << 8))); // was originally an int16
     }
 
     public static int mi_sint3korr(byte[] a) {
         return ((a[0] < 0)   // looks for bit 0x80 (the first bit in a -> signed or unsigned)
                 ? ( (((int)  255) << 24) // when signed, fills the MSB of our int with 0xff to correctly represent two's-complement of the remaing 3 byte value
-                   |(((int) a[0]) << 16)
-                   |(((int) a[1]) << 8) 
-                   | ((int) a[2]))
-                : ( (((int) a[0]) << 16)
-                   |(((int) a[1]) << 8)
-                   | ((int) a[2])));
+                   |(((int) ubyte(a[0])) << 16)
+                   |(((int) ubyte(a[1])) << 8)
+                   | ((int) ubyte(a[2])))
+                : ( (((int) ubyte(a[0])) << 16)
+                   |(((int) ubyte(a[1])) << 8)
+                   | ((int) ubyte(a[2]))));
     }
 
     public static int mi_sint4korr(byte [] a) {
-        return ( ((int) a[3]) +
-                (((int) a[2]) << 8) +
-                (((int) a[1]) << 16) +
-                (((int) a[0]) << 24));
+        return ( ((int) ubyte(a[3])) +
+                (((int) ubyte(a[2])) << 8) +
+                (((int) ubyte(a[1])) << 16) +
+                (((int) ubyte(a[0])) << 24));
     }
 
     public static int roundUp(int x) {
@@ -240,7 +245,7 @@ public class Decimal {
       StringBuffer sb = new StringBuffer();
       //pos+= my_sprintf(buff, (buff, "%s", dec.sign() ? "-" : ""));
       sb.append(this.sign?"-":"");
-
+      
       end= roundUp(this.frac) + roundUp(this.intg)-1;
       for (i=0; i < end; i++) {
           //pos+= my_sprintf(pos, (pos, "%09d.", dec.buf[i]));
@@ -252,3 +257,4 @@ public class Decimal {
       return sb.toString();
     }
 }
+
