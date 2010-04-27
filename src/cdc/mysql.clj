@@ -11,6 +11,7 @@
   (:import (java.io File FileInputStream)
            java.util.Arrays
            java.util.concurrent.LinkedBlockingQueue
+           java.util.concurrent.BlockingQueue
            java.util.concurrent.atomic.AtomicReference
            (java.nio ByteBuffer
                      ByteOrder)
@@ -70,7 +71,7 @@
 (defn cstring
   "Return a String from the array a, possibly ignoring the trailing 0."
   [#^bytes a]
-  (if (-> a (aget (dec (alength a))) zero?)
+  (if (-> a (aget (dec (alength a))) int (== 0))
     (String. a 0 (dec (alength a)))
     (String. a)))
 
@@ -79,9 +80,9 @@
   in little endian format."
   [#^bytes a]
   (areduce a i res (long 0)
-           (long (bit-or res
-                         (bit-shift-left (bit-and 0xff (aget a i))
-                                         (* i 8))))))
+           (long (bit-or (int res)
+                         (int (bit-shift-left (bit-and (int 0xff) (int (aget a i)))
+                                               (int (* i 8))))))))
 
 (defn bytes-required-for-bits
   "Return the numbers of bytes required to encode an n-bitfield."
@@ -90,9 +91,9 @@
 
 (defn bitfield-count-bits
   "count all set bits in the bitfield."
-  [bf]
+  [#^bytes bf]
   (areduce bf i ret (int 0)
-           (unchecked-add ret (Integer/bitCount (bit-and (aget bf i) 0xff)))))
+           (unchecked-add ret (Integer/bitCount (bit-and (int (aget bf i)) 0xff)))))
 
 ;; (defn bit-seq
 ;;   "return a seq of 8 booleans from a byte beginning with
@@ -104,9 +105,9 @@
   "Return the nth bit from an array of bytes using the following scheme:.
   nth:   7 6 5 4 3 2 1 0 | f e d c b a 9 8 | ...
   bytes:      byte0      |      byte1      | byteN"
-  [a n]
-  (bit-and 1 (bit-shift-right (aget a (quot n 8))
-                              (rem n 8))))
+  [#^bytes a n]
+  (bit-and 1 (bit-shift-right (int (aget a (quot n 8)))
+                              (int (rem n 8)))))
 
 ;; (defn bitfield-filter
 ;;   "Filter all elements in seq where the corresponding bit is set."
@@ -121,13 +122,13 @@
 
 (defn get-ubyte
   "and return an Integer."
-  ([#^ByteBuffer b] (bit-and (.get b) 0xff))
-  ([#^ByteBuffer b o] (bit-and (.get b (int o)) 0xff)))
+  ([#^ByteBuffer b] (bit-and (int (.get b)) 0xff))
+  ([#^ByteBuffer b o] (bit-and (int (.get b (int o))) 0xff)))
 
 (defn get-ushort
   "and return an Integer."
-  ([#^ByteBuffer b] (bit-and (.getShort b) 0xffff))
-  ([#^ByteBuffer b o] (bit-and (.getShort b (int o)) 0xffff)))
+  ([#^ByteBuffer b] (bit-and (int (.getShort b)) 0xffff))
+  ([#^ByteBuffer b o] (bit-and (int (.getShort b (int o))) 0xffff)))
 
 (defn get-uint
   "and return a Long."
@@ -137,12 +138,15 @@
 (defn get-array
   "return an Array of bytes, alters the Buffers position"
   ([#^ByteBuffer b len]
-     (let [a (make-array Byte/TYPE len)]
+     (let [a #^bytes (make-array Byte/TYPE len)]
        (.get b a)
        a))
   ([#^ByteBuffer b o len]
-     (let [a (make-array Byte/TYPE len)]
-       (-> b (.position o) (.get a))
+     (let [a #^bytes (make-array Byte/TYPE len)]
+       ;;(-> b (.position o) (.get a))
+       (doto b
+         (.position o)
+         (.get a))
        a)))
 
 (defn get-length-hinted-string
@@ -153,7 +157,7 @@
   [#^ByteBuffer b]
   (let [len (get-ubyte b)
         s (if (< 0 len)
-            (String. (get-array b len))
+            (String. #^bytes (get-array b len))
             "")]
     (.get b) ;; trailing 0
     s))
@@ -262,7 +266,7 @@
 
 (defn read-event-header
   "b is a nio ByteBuffer, o is the offset into this buffer."
-  [b o]
+  [#^ByteBuffer b o]
   ;; +=====================================+
   ;; | event  | timestamp         0 : 4    | ;; UTC, number of seconds since 1970
   ;; | header +----------------------------+
@@ -311,14 +315,14 @@
         header-len (get-ubyte b 75)
         ev-len (:event-len e)]
     (merge e {:binlog-version (get-ushort b (+ o 19))
-              :server_version (-> b (get-array (+ o 21) 50) strip-0s String.)
+              :server_version (String. #^bytes (strip-0s (get-array b (+ o 21) 50)))
               :create-timestamp (get-uint b (+ o 71))
               :header-len header-len
               :extra-headers-len (- header-len (+ o 19))
               :post-header-len (vec (get-array b (+ o 76) (- (:event-len e) 76)))
               })))
 
-(defn read-query [b e] ;; QUERY_EVENT
+(defn read-query [#^ByteBuffer b e] ;; QUERY_EVENT
   ;;; fixed:
   ;; * 4 bytes. The ID of the thread that issued this statement. Needed for temporary tables. This is also useful for a DBA for knowing who did what on the master.
   ;; * 4 bytes. The time in seconds that the statement took to execute. Only useful for inspection by the DBA.
@@ -356,7 +360,7 @@
   ;;     * The name of the next binary log. The filename is not null-terminated. Its length is the event size minus the size of the fixed parts.
   (merge e {:next-file (-> b (get-array (+ 27 (:offset e)) (- (:event-len e) 27)) cstring)}))
 
-(defn read-xid [b e] ;; XID_EVENT
+(defn read-xid [#^ByteBuffer b e] ;; XID_EVENT
   (merge e {:xid (.getLong b (+ 19 (:offset e)))}))
 
 ;;; row based replication events
@@ -454,7 +458,7 @@
   "Return an int-array which contains the metadata for each column or 0.
   The ByteBuffer b has to be positioned at the start of the metadata section."
   [b column-types]
-  (let [ct column-types]
+  (let [ct #^bytes column-types]
     (areduce ct i ret (int-array (alength ct))
              (let [l (column-metadata-lengths (aget ct i))]
                (cond (zero? l) nil
@@ -463,7 +467,7 @@
                      :else (throwf "invalid column-metadata length: %d" l))
                ret))))
 
-(defn read-table-map [b e] ;; TABLE_MAP_EVENT
+(defn read-table-map [#^ByteBuffer b e] ;; TABLE_MAP_EVENT
   ;; !!!: For null-terminated strings that are preceded by a length field, the length does __not_include_the_terminating_null_byte__, unless otherwise indicated. 
   ;; In row-based mode, every row operation event is preceded by a Table_map_log_event which maps a table definition to a number. The table definition consists of database name, table name, and column definitions.
   ;; 6 byte table_id
@@ -491,7 +495,7 @@
 
 ;;; xxx_rows_events:
 
-(defn read-type [b type-id len]
+(defn read-type [#^ByteBuffer b type-id len]
   ;; len == column-meta: is almost exclusively used for length parameters
   (cond (= type-id (c type-set)) ;; a bitset
           (get-array b len)
@@ -505,9 +509,9 @@
             (= type-id (c type-var-string))
             (= type-id (c type-varchar)))
           (if (< len 256)
-            (-> (get-array b (get-ubyte b)) String.)
+            (String. #^bytes (get-array b (get-ubyte b)))
             ;;(println (format "reading string (%d) '%s'" len  s))
-            (-> (get-array b (get-ushort b)) String.))
+            (String. #^bytes (get-array b (get-ushort b))))
         
         ;; numbers
         (= type-id (c type-long))
@@ -517,7 +521,7 @@
         ;; decimal
         (= type-id (c type-newdecimal))
           (let [precision (bit-and len 0xff)
-                scale (bit-shift-right len 8)
+                scale (bit-shift-right (int len) 8)
                 size (Decimal/decimalBinSize precision scale)]
             ;;(println "read-type: decimalBinSize" precision scale size)
             (Decimal/binToDecimal (get-array b size) precision scale))
@@ -531,7 +535,7 @@
   (if (and (== column-type (c type-string))
            (<= 256 column-meta))
     ;; special encoding of char(UTF8) fields
-    (let [byte0 (bit-shift-left column-meta 8)
+    (let [byte0 (bit-shift-left (int column-meta) 8)
           byte1 (bit-and column-meta 0xff)]
       (if (not= (bit-and byte0 0x30) ;; actually two ints
                 0x30)
@@ -548,8 +552,8 @@
 (defn read-row
   "Read a single row from ByteBuffer."
   [b ;; the bytebuffer, assumed to be in positioned at the start of the rows section (the variable part of the XXX_ROWS_EVENT)
-   column-types ;; an array of bytes, serving as a map from col# -> coltype
-   column-meta ;; an array of ints, serving as a map from col# -> colmeta (column metadata is at most 2bytes long, byte0=LSB, byte4=MSB)
+   #^bytes column-types ;; an array of bytes, serving as a map from col# -> coltype
+   #^ints column-meta ;; an array of ints, serving as a map from col# -> colmeta (column metadata is at most 2bytes long, byte0=LSB, byte4=MSB)
    used-columns] ;; a bitfield, access with nth-bit, each nth bit indicates that the nth column is used in the row
   (let [nulls (get-bitfield b (bitfield-count-bits used-columns))]
     (loop [col-idx 0  ;; index into column-types, column-meta and used-columns(bitfield)
@@ -574,7 +578,7 @@
                  (conj data '_)))
         data))))
 
-(defn read-wud-rows [b e table-map-event] ;; WRITE_ROWS_EVENT, DELETE_ROWS_EVENT, UPDATE_ROWS_EVENT
+(defn read-wud-rows [#^ByteBuffer b e table-map-event] ;; WRITE_ROWS_EVENT, DELETE_ROWS_EVENT, UPDATE_ROWS_EVENT
   ;; Write_rows_log_event/WRITE_ROWS_EVENT
   ;; Used for row-based binary logging beginning with MySQL 5.1.18.
   ;; [TODO: following needs verification; it's guesswork]
@@ -618,7 +622,7 @@
   ;;     * For WRITE_ROWS_LOG_EVENT, the row described by the row-image is inserted.
   ;;     * For DELETE_ROWS_LOG_EVENT, a row matching the given row-image is deleted.
   ;;     * For UPDATE_ROWS_LOG_EVENT, a row matching the first row-image is removed, and the row described by the second row-image is inserted. 
-  (let [b (.position b (+ 19 (:offset e)))
+  (let [b #^ByteBuffer (.position b (+ 19 (:offset e)))
         next-entry-offset (+ (:offset e) (:event-len e)) ;;(:next e)
         column-types (:column-types table-map-event)
         column-meta (:column-meta table-map-event)
@@ -652,7 +656,7 @@
   "Scan buf (ByteBuffer) and read all events starting at position 0
   in the byte buffer."
   ([buf] (all-events buf {:event-len 0 :offset 0}))
-  ([buf prev-evt]
+  ([#^ByteBuffer buf prev-evt]
      (lazy-seq (let [e (read-event-header buf
                                           (+ (:offset prev-evt) (:event-len prev-evt)))]
                  (cons e (if (< (+ (:offset e) (:event-len e)) (.capacity buf))
@@ -819,7 +823,7 @@
   "read the binlog from (state :offset) to end."
   [state]
   (let [[xid events rotate-event] (read-binlog (:logname state) (:offset state))]
-    (.put *event-queue* events)
+    (.put #^BlockingQueue *event-queue* events)
     (when rotate-event (send *state* cdc-log-rotation rotate-event))
     (merge state
            {:xid (:xid xid)
@@ -847,6 +851,18 @@
   (send *state* cdc-stop)
   ;; read events from the Queue:
   (.pop *event-queue*)
+
+
+  ;; read the binlog manually
+  (time
+   (let [[xid events rot]
+         (read-binlog
+          ;; logfile
+          "/var/log/mysql/binlog.000052"
+          ;; offset
+          ;;102771
+          )]
+     (count events)))
   )
 
 
