@@ -4,8 +4,7 @@
 ;;                    pointers in the file-structure (e.g. "next")
 ;;                    have to be recalculated as (- next offset)
 ;;       alternative: do not use header/next, instead use the relative
-;;                    header/len + event-offset!!!
-;; ++++ FIGURE THIS OUT ON THURSDAY!! +++++
+;;                    header/len + event-offset!!! ;; DONE
 
 (ns cdc.mysql
   (:use (clojure.contrib pprint except))
@@ -642,6 +641,8 @@
                                      (read-row b column-types column-meta used-cols))))
                  rows))]
     (merge e {:table-id table-id
+              ;; resolve table-name?
+              :table-name (:table-name table-map-event)
               :rows rows})))
 
 
@@ -701,17 +702,17 @@
                           xid
                           more
                           (conj decoded-events (read-wud-rows b e table-map-e)))
-                   (= (type e) 'XID_EVENT)
+                   (= (:type e) 'XID_EVENT)
                    (recur table-map-e
                           xid
                           more
                           (conj decoded-events (read-xid b e)))
-                   (= (type e) 'QUERY_EVENT)
+                   (= (:type e) 'QUERY_EVENT)
                    (recur table-map-e
                           xid
                           more
                           (conj decoded-events (read-query b e)))
-                   (or (nil? e) (= (type e) 'ROTATE_EVENT))
+                   (or (nil? e) (= (:type e) 'ROTATE_EVENT))
                    [xid decoded-events e]
                    :else
                    (recur table-map-e
@@ -774,6 +775,8 @@
 
 (defn most-recent-binlog [binlog-index-file]
   ;; (most-recent-binlog "/var/log/mysql/binlog-files.index")
+  ;; additionally: scan the most-recent binlog for an
+  ;; rotate-event.
   (last (seq (.split #"\n" (slurp binlog-index-file)))))
 
 (defn listen-for-modify
@@ -794,23 +797,13 @@
   JNotify and the :query-fn function."
   [state]
   (let [our-agent *agent*]
-    (assoc :watch-id
+    (assoc state :watch-id
       (listen-for-modify (:logname state)
                          #((:queue-fn state) our-agent)))))
 
 (defn jnotify-remove-watch [watch-id]
   (when (number? watch-id) (JNotify/removeWatch watch-id))
   nil)
-
-(defn cdc-start [state index-file]
-  (let [new-state {:xid nil
-                   ;; reset the offset
-                   ;; ignore the binlog-magic at the beginning of every binlog file
-                   :offset 4
-                   :logname (most-recent-binlog index-file)
-                   :queue-fn (queuing-send-fn cdc-turn)}]
-    (send *agent* cdc-add-watch-for-modification!)
-    (merge state new-state)))
 
 (defn cdc-log-rotation
   "Switch to a new log file"
@@ -832,15 +825,28 @@
            {:xid (:xid xid)
             :offset (:next (peek events))})))
 
+(defn cdc-start [state index-file]
+  (let [new-state {:xid nil
+                   ;; reset the offset
+                   ;; ignore the binlog-magic at the beginning of every binlog file
+                   :offset 4
+                   :logname (most-recent-binlog index-file)
+                   :queue-fn (queuing-send-off-fn cdc-turn)}]
+    (send *agent* cdc-add-watch-for-modification!)
+    (merge state new-state)))
+
 (defn cdc-stop [state]
   (when (:watch-id state) (JNotify/removeWatch (:watch-id state)))
   state)
 
 
 (comment
+  ;; start the cdc-mechanism
   (send-off *state* cdc-start "/var/log/mysql/binlog-files.index")
+  ;; stop it
   (send *state* cdc-stop)
-  
+  ;; read events from the Queue:
+  (.pop *event-queue*)
   )
 
 
