@@ -776,14 +776,14 @@
 
 ;;; the application, basically works but needs some cleanup here and there
 
-(defn cdc-init []
+(defn cdc-init [event-fn]
   "returns an agent containg the initial state"
   (agent {:watch-id nil
-                     :logname nil
-                     :offset nil
-          :queue-fn nil}))
-
-(def *event-queue* (LinkedBlockingQueue. 10))
+          :logname nil
+          :offset nil
+          :queue-fn nil ;; function which gets called on JNotify events
+          :event-fn event-fn ;; function which is called with the event-data
+          }))
 
 (defn most-recent-binlog [binlog-index-file]
   ;; (most-recent-binlog "/var/log/mysql/binlog-files.index")
@@ -830,10 +830,11 @@
     :logname (:next-file rotation-event)))
 
 (defn cdc-turn
-  "read the binlog from (state :offset) to end."
+  "read the binlog from (state :offset) to end. Call (state :event-fn) with
+  the resulting events."
   [state]
   (let [[xid events rotate-event] (read-binlog (:logname state) (:offset state))]
-    (.put #^BlockingQueue *event-queue* events)
+    ((:event-fn state) events)
     (when rotate-event (send *agent* cdc-log-rotation rotate-event))
     (merge state
            {:xid (:xid xid)
@@ -858,18 +859,25 @@
   state)
 
 
+
+
 (comment
   ;;; example usage:
-  ;; init state
-  (def *state* (cdc-init))
-  ;; start the cdc-mechanis
-  (send-off *state* cdc-start "/var/log/mysql/binlog-files.index")
+  ;; our queue, events are stored here
+  (def *queue* (LinkedBlockingQueue. 10))
+  ;; init state with an event-callback:
+  (def *state* (cdc-init #(.put #^BlockingQueue  events)))
+  ;; start the cdc-mechanism
+  (send-off *state* cdc-start "/var/log/mysql/binlog-files.index" )
+
+  ;; pop sql-events off the *queue* 
+  (.poll *queue* 200 TimeUnit/MILLISECONDS)
+  
   ;; stop it
   (send *state* cdc-stop)
-  ;; read events from the Queue:
-  (.poll binlog/*event-queue* 200 TimeUnit/MILLISECONDS)
   
-  ;; read the binlog manually:
+   
+  ;; or read the binlog manually:
   (time
    (let [[xid events rot]
          (read-binlog
