@@ -652,6 +652,7 @@
     (merge e {:table-id table-id
               ;; resolve table-name?
               :table-name (:table-name table-map-event)
+              :db-name (:db-name table-map-event)
               :rows rows})))
 
 
@@ -663,10 +664,8 @@
   Stop if the next event is outside the "
   ([buf] (all-events buf {:event-len 0 :offset 0}))
   ([#^ByteBuffer buf prev-evt]
-     (lazy-seq (when-let [e (read-event-header buf
-                                               (+ (:offset prev-evt) (:event-len prev-evt)))]
-                 (cons e (if (< (+ (:offset e) (:event-len e)) (.capacity buf))
-                           (all-events buf e)))))))
+     (lazy-seq (when-let [e (read-event-header buf (+ (:offset prev-evt) (:event-len prev-evt)))]
+                 (cons e (all-events buf e))))))
 
 ;; (defn further-decode-event [b e]
 ;;   (case (:type e)
@@ -679,8 +678,7 @@
 ;;         e))
 
 (defn with-open-binlog*
-  "Try to open file-name and memory-map it to a ByteBuffer beginning at
-  offset. Expect offset to point to the beginning of an event."
+  "Try to open file-name and memory-map it to a ByteBuffer beginning at offset."
   ([file-name f] (with-open-binlog* file-name 0 f))
   ([file-name offset f]
      (when-not (binlog-file? file-name) (throwf "'%s' is not a mysql-binlog file!" file-name))
@@ -692,43 +690,51 @@
 
 (defn read-binlog
   "Read the binary log, beginning at offset.
-  Return: [last-transaction-id, event-vector, rotation-event]"
+  Return: [event-vector, rotation-event]"
   ([fname] (read-binlog fname 4))
-  ([fname start-offset]
+  ([fname start-offset] (read-binlog fname start-offset nil))
+  ([fname start-offset table-map-evt]
+     (println"with-open-binlog:" fname start-offset)
      (with-open-binlog* fname start-offset
        (fn [b]
-         (loop [table-map-e nil
-                xid nil
-                [e & more] (all-events b)
+         (loop [table-map-e table-map-evt
+                [e & more :as es] (all-events b)
                 decoded-events []]
            (cond (= (:type e) 'TABLE_MAP_EVENT)
-                   (let [tm (read-table-map b e)]
-                     (recur tm
-                            xid
-                            more
-                            (conj decoded-events tm)))
-                   ('#{WRITE_ROWS_EVENT UPDATE_ROWS_EVENT DELETE_ROWS_EVENT} (:type e))
-                   (recur table-map-e
-                          xid
+                 (let [tm (read-table-map b e)]
+                   (recur tm
                           more
-                          (conj decoded-events (read-wud-rows b e table-map-e)))
-                   (= (:type e) 'XID_EVENT)
+                          (conj decoded-events tm)))
+                 ('#{WRITE_ROWS_EVENT UPDATE_ROWS_EVENT DELETE_ROWS_EVENT} (:type e))
+                 (recur table-map-e
+                        more
+                        (conj decoded-events
+                              (if table-map-e
+                                (read-wud-rows b e table-map-e)
+                                (throwf "No TABLE_MAP event for read-wud-rows!"))))
+                 (= (:type e) 'XID_EVENT)
+                 (recur table-map-e
+                        more
+                        (conj decoded-events (read-xid b e)))
+                 (= (:type e) 'QUERY_EVENT)
+                 (recur table-map-e
+                        more
+                        (conj decoded-events (read-query b e)))
+                 (nil? es)
+                 (do ;; (println"read-binlog:" (count decoded-events) "events and NO rotation-event")
+                   [decoded-events nil table-map-e])
+                 (nil? e) ;; just filter
+                 (do      ;; (println"event is nil!")
                    (recur table-map-e
-                          xid
                           more
-                          (conj decoded-events (read-xid b e)))
-                   (= (:type e) 'QUERY_EVENT)
-                   (recur table-map-e
-                          xid
-                          more
-                          (conj decoded-events (read-query b e)))
-                   (or (nil? e) (= (:type e) 'ROTATE_EVENT))
-                   [xid decoded-events e]
-                   :else
-                   (recur table-map-e
-                          xid
-                          more
-                          (conj decoded-events e))))))))
+                          decoded-events))
+                 (= (:type e) 'ROTATE_EVENT) ;; stop when rotate event is read
+                 (do ;; (println"read-binlog:" (count decoded-events) "events and rotation-event:" (:next-file (read-rotate b e)))
+                   [decoded-events (read-rotate b e) table-map-e])
+                 :else
+                 (recur table-map-e
+                        more
+                        (conj decoded-events e))))))))
 
 ;; (def example-binlog-file "/home/timmy-turner/clj/tmp/binlog.000026")
 ;; (def rbr #(->> example-binlog-file read-binlog))
@@ -750,28 +756,32 @@
   f was still running."
   [f]
   (let [state (ref {:state nil :pending 0})]
-    (fn this [the-agent]
-      (let [run? (dosync (cond (= :running (:state @state))
-                                 (do (alter state update-in [:pending] inc)
-                                     false)
-                               (< 0 (@state :pending))
-                                 (do (alter state assoc
-                                            :state :running
-                                            :pending 0)
-                                     true)
-                               (= 0 (@state :pending))
-                                 (do (alter state assoc :state :running)
-                                     true)
-                               :else false))]
-        (when run? (send-off the-agent #(let [ret (f %)
-                                              run-again? (dosync (if (< 0 (:pending @state))
-                                                                   (do (alter state assoc :pending 0)
-                                                                       true)
-                                                                   (do (alter state assoc :state nil)
-                                                                       false)))]
-                                          (when run-again? (send-off the-agent f))
-                                          ret)))
-        state))))
+    (def _xxx_state state)
+    (fn [the-agent]
+      ;; (println"queue function has been called:" state (:logname @the-agent) (Thread/currentThread))
+      (try
+       (let [run? (dosync (if (= :running (:state @state))
+                            ;; -> count
+                            (do (alter state update-in [:pending] inc)
+                                false)
+                            ;; -> run
+                            (do (alter state assoc :pending 0 :state :running)
+                                true)))]
+         (when run? (send-off the-agent (fn this [s]
+                                          ;; (println">>this f")
+                                          (let [ret (f s)
+                                                ;; _ (println"<<this f")
+                                                run-again? (dosync (if (< 0 (:pending @state))
+                                                                     (do (alter state assoc :pending 0)
+                                                                         true)
+                                                                     (do (alter state assoc :state nil :pending 0)
+                                                                         false)))]
+                                            ;; (println"queue f has finished:" run-again? state (:logname @the-agent))
+                                            (when run-again? (send-off the-agent this))
+                                            ret))))
+         state)
+       (catch Exception e (do ;; (println"Exception while executing queue-fn: " e)
+                              (def _queue-fn-exception e)))))))
 
 
 ;;; the application, basically works but needs some cleanup here and there
@@ -791,72 +801,126 @@
   ;; rotate-event.
   (last (seq (.split #"\n" (slurp binlog-index-file)))))
 
-(defn listen-for-modify
-  "Add a modify watcher to file-name. Run f with the file-name on modification
-  events."
-  ;; note: INotify (linux) is able to coerce recent (unread) events into one event
-  [file-name f]
-  (JNotify/addWatch
-   file-name
-   JNotify/FILE_MODIFIED
-   false ;; watch-subtree
-   (proxy [JNotifyListener] []
-     (fileModified [watch-descriptor, path, name]
-       (f)))))
+;; (defn listen-for-modify
+;;   "Add a modify watcher to file-name. Run f with the file-name on modification
+;;   events."
+;;   ;; note: INotify (linux) is able to coerce recent (unread) events into one event
+;;   [file-name f]
+;;   (println "cdc-add-watch" file-name (Thread/currentThread))
+;;   (JNotify/addWatch
+;;    file-name
+;;    JNotify/FILE_MODIFIED
+;;    false ;; watch-subtree
+;;    (proxy [JNotifyListener] []
+;;      (fileModified [watch-descriptor, path, name]
+;;        (f)))))
 
-(defn cdc-add-watch-for-modification! ;; needs a better name
-  "registers a modification listener using
-  JNotify and the :query-fn function."
-  [state]
-  (let [our-agent *agent*]
-    (assoc state :watch-id
-      (listen-for-modify (:logname state)
-                         #((:queue-fn state) our-agent)))))
+(defn jnotify-swap-modify-watchers
+  "Given the current watch-id and a new file and the action-function,
+  add a modify-watcher to the new file and then remove the watcher
+  from the old file, under the assumption that there will be no more
+  write events to the old file.
+  Watch-id may be ommited, in which case only a new file-watch is created.
+  If only a watch-id is given, remove the watcher and return nil.
+  Return the new watch-id."
+  ;; this is necessary because for linux, removing one watch and
+  ;; adding another watch for a file instantly will return the same
+  ;; watch-id (the one the removed file had) and JNotify can't handle
+  ;; this properly - if there is even a chance to handle this
+  ;; situation coorect without breaking other JNotify uses.
+  ([watch-id] (jnotify-swap-modify-watchers watch-id nil nil))
+  ([new-filename action-f] (jnotify-swap-modify-watchers nil new-filename action-f))
+  ([watch-id new-filename action-f]
+     (let [new-watch-id (when (and new-filename action-f)
+                          (JNotify/addWatch new-filename
+                                            JNotify/FILE_MODIFIED
+                                            false ;; watch subtree
+                                            (proxy [JNotifyListener] []
+                                              (fileModified [watch-descriptor, path, name]
+                                                            (action-f)))))]
+       (when watch-id (JNotify/removeWatch watch-id))
+       new-watch-id)))
 
-(defn jnotify-remove-watch
-  "remove jnotify watch watch-id, which may be nil"
-  [watch-id]
-  (when (number? watch-id) (JNotify/removeWatch watch-id))
-  nil)
+;; (defn cdc-add-watch-for-modification! ;; needs a better name
+;;   "registers a modification listener using
+;;   JNotify and the :queue-fn function."
+;;   [state]
+;;   (let [our-agent *agent*
+;;         f (.submit (:jnotify-executor state)
+;;                    (fn []
+;;                      (send our-agent assoc
+;;                            :watch-id
+;;                            (listen-for-modify (:logname state) #((:queue-fn state) our-agent)))))]
+;;     state))
+
+;; (defn jnotify-remove-watch
+;;   "remove jnotify watch watch-id, which may be nil"
+;;   [state watch-id]
+;;   (when (number? watch-id)
+;;     ;; (println"removing watch" watch-id "from " (:logname state))
+;;     (let [fut (.submit (:jnotify-executor state)
+;;                        (fn []
+;;                          (println "cdc-remove-watch" (:logname state) (Thread/currentThread))
+;;                          (JNotify/removeWatch watch-id)))]
+;;       ;; (println"remove-result:" (.get fut))
+;;       ))
+;;   state)
+
+(defn cdc-swap-modify-watchers [{ln :logname af :queue-fn id :watch-id :as state}]
+  (let [a *agent*]
+    (assoc state :watch-id (jnotify-swap-modify-watchers id ln #(af a)))))
 
 (defn cdc-log-rotation
   "Switch to a new log file"
   [state rotation-event]
+  ;; (println"cdc-log-rotation:" (:logname state) (:next-file rotation-event))
+  (def _cdc-log-rot [rotation-event state *agent*])
   ;; hook on new binlog
-  (send *agent* cdc-add-watch-for-modification!)
+  ;; (send *agent* cdc-swap-modify-watchers)
+  ;; trigger a first parse on the binlog, we might have missed some events
+  (send *agent* cdc-swap-modify-watchers)
+  (send *agent* (fn [s]
+                  ;; (println "running queue function"
+                  ((:queue-fn state) *agent*)
+                  ;; )
+                  s))
   (assoc state
-    :watch-id (jnotify-remove-watch (:watch-id state))
     :offset 4
-    :logname (:next-file rotation-event)))
+    :table-map nil
+    :logname (str (File. (.getParentFile (File. (:logname state))) (:next-file rotation-event)))))
 
 (defn cdc-turn
   "read the binlog from (state :offset) to end. Call (state :event-fn) with
   the resulting events."
   [state]
-  (let [[xid events rotate-event] (read-binlog (:logname state) (:offset state))]
-    ((:event-fn state) events)
+  (let [[events rotate-event table-map-e] (read-binlog (:logname state)
+                                                       (:offset state)
+                                                       (:table-map state))
+        new-state (assoc state
+                    :table-map table-map-e
+                    :offset (or (:next (peek events)) (:offset state)))]
     (when rotate-event (send *agent* cdc-log-rotation rotate-event))
-    (merge state
-           {:xid (:xid xid)
-            :offset (:next (peek events))})))
+    (when-not (empty? events) ((:event-fn state) events))
+    new-state))
 
 (defn cdc-start
   "Sets up the cdc-mechanism to read events from the first binlog file found
   in index-file."
   [state index-file]
-  (let [new-state {:xid nil
-                   ;; reset the offset
+  (let [new-state {;; reset the offset
                    ;; ignore the binlog-magic at the beginning of every binlog file
                    :offset 4
                    :logname (most-recent-binlog index-file)
-                   :queue-fn (queuing-send-off-fn cdc-turn)}]
+                   :queue-fn (queuing-send-off-fn cdc-turn)
+                   ;; jnotify thread isolation
+                   :jnotify-executor (java.util.concurrent.Executors/newSingleThreadExecutor)}]
     (when (= nil *agent*) (throwf "Must be called within an agent"))
-    (send *agent* cdc-add-watch-for-modification!)
+    (send *agent* cdc-swap-modify-watchers)
     (merge state new-state)))
 
 (defn cdc-stop [state]
-  (when (:watch-id state) (JNotify/removeWatch (:watch-id state)))
-  state)
+  (when (:watch-id state) (jnotify-swap-modify-watchers (:watch-id state)))
+  (assoc state :watch-id nil))
 
 
 
@@ -866,7 +930,7 @@
   ;; our queue, events are stored here
   (def *queue* (LinkedBlockingQueue. 10))
   ;; init state with an event-callback:
-  (def *state* (cdc-init #(.put #^BlockingQueue  events)))
+  (def *state* (cdc-init #(.put #^BlockingQueue %)))
   ;; start the cdc-mechanism
   (send-off *state* cdc-start "/var/log/mysql/binlog-files.index" )
 
@@ -879,7 +943,7 @@
    
   ;; or read the binlog manually:
   (time
-   (let [[xid events rot]
+   (let [[events rot]
          (read-binlog
           ;; logfile
           "/var/log/mysql/binlog.000052"
