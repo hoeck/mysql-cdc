@@ -13,6 +13,7 @@
            java.util.concurrent.atomic.AtomicReference
            (java.nio ByteBuffer
                      ByteOrder)
+           (java.nio.charset Charset)
            (java.nio.channels FileChannel
                               FileChannel$MapMode)
            (net.contentobjects.jnotify JNotify
@@ -509,14 +510,14 @@
           (cond (= len 1) (get-ubyte b)
                 (= len 2) (get-uint b)
                 :else (throwf "invalid enum len: %d" len))
-        ;; strings
+        ;; strings, use the (Charset/forName "ISO-8859-1") == latin1 as default encoding
         (or (= type-id (c type-string))
             (= type-id (c type-var-string))
             (= type-id (c type-varchar)))
           (if (< len 256)
-            (String. #^bytes (get-array b (get-ubyte b)))
+            (String. #^bytes (get-array b (get-ubyte b)) (Charset/forName "ISO-8859-1"))
             ;;(println (format "reading string (%d) '%s'" len  s))
-            (String. #^bytes (get-array b (get-ushort b))))
+            (String. #^bytes (get-array b (get-ushort b)) (Charset/forName "ISO-8859-1")))
         
         ;; numbers
         (= type-id (c type-long))
