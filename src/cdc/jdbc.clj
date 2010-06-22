@@ -51,9 +51,9 @@
 
 (deftype ResultSetMetaData [schema table row]
   java.sql.ResultSetMetaData 
-  (getCatalogName [t c] "")       ;; Gets the designated column's table's catalog name.
-  (getColumnClassName [t c] (type (nth row c)))   ;;Returns the fully-qualified name of the Java class whose instances are manufactured if the method ResultSet.getObject is called to retrieve a value from the column.
-  (getColumnCount [t] (count row))       ;; int; Returns the number of columns in this ResultSet object.
+  (getCatalogName [t c] "") ;; Gets the designated column's table's catalog name.
+  (getColumnClassName [t c] (type (nth row c))) ;;Returns the fully-qualified name of the Java class whose instances are manufactured if the method ResultSet.getObject is called to retrieve a value from the column.
+  (getColumnCount [t] (count row)) ;; int; Returns the number of columns in this ResultSet object.
   (getColumnDisplaySize [t c] 1024) ;; int; Indicates the designated column's normal maximum width in characters.
   (getColumnLabel [t c] (str c)) ;; String; Gets the designated column's suggested title for use in printouts and displays.
   (getColumnName [t c] (str c)) ;; String; Get the designated column's name.
@@ -77,7 +77,7 @@
   (isSearchable [t c] false) ;; boolean; Indicates whether the designated column can be used in a where clause.
   (isSigned [t c] true) ;; boolean; Indicates whether values in the designated column are signed numbers.
   (isWritable [t c] false) ;; boolean; Indicates whether it is possible for a write on the designated column to succeed.
-)
+  )
 
 (defn rows-delta-type
   "Return a fn that, given an event returns a seq of rows according to
@@ -149,17 +149,17 @@
                                      (.replace "\"" "")
                                      (.split "\\.")
                                      reverse)
-        s (->> (repeatedly #(let [_ (println "before taking")
-                                  e (.take queue)
-                                  _ (println "took" (count e) "events")]
-                              e))
+        s (->> (repeatedly #(.take queue))
                (really-lazy-concat)
-               (filter #(and (= (:table-name %) table-name) (= (:db-name %) schema-name)))
+               (filter #(and (= (:table-name %) table-name)
+                             (= (:db-name %) schema-name)))
                (map rows-delta-type)
                (really-lazy-concat)
                (filter (if dtype
                          #(= (last %) dtype)
-                         identity)))]
+                         identity))
+               ;; in jdbc, one must call .next on the resultset to get the first row
+               (cons nil))]
     s))
 
 ;; (defn test-create-resultset-seq []
@@ -174,11 +174,13 @@
   `(if-let [v# (nth (first ~'rows) ~'i)]
      (do (set! ~'was-null? false)
          v#)
-     (set! ~'was-null? true)))
+     (do (set! ~'was-null? true)
+         nil)))
 
+;; generic resultset implementation
 ;; please, single threaded access only!
 ;; nothing coordinated, step back!
-(deftype ResultSet [#^{:volatile-mutable true} rows ;; a set of vectors of columnvalues
+(deftype ResultSet [#^{:volatile-mutable true} rows ;; a set of vectors of columnvalues, starting with a nil
                     #^{:volatile-mutable true} was-null?
                     sql]
   java.sql.ResultSet
@@ -187,10 +189,15 @@
                      (alter jdbc-state assoc :resultset nil)))
   (isClosed [t])
   (next [t]
-        ;; moves cursor one row forward
-        (set! rows (next rows)))
+        ;; moves cursor one row forward if there is a row
+        (if-let [r (next rows)]
+          (do (set! rows r)
+              true)
+          false))
   (wasNull [t] (boolean was-null?)) ;; whether the last access to any col was sql-null
-  (getMetaData [t] (ResultSetMetaData. "" "" (first rows))) ;; ResultSetMetaData
+  (getMetaData [t]
+               ;; generate resultset metadata using the first row
+               (ResultSetMetaData. "" "" (second rows))) ;; ResultSetMetaData
   (findColumn [t label]) ;; returns the colnumber
   
   ;; data getters
@@ -300,7 +307,14 @@
   (cancelRowUpdates [t] (throwf-sql-not-supported)))
 
 (defn create-resultset [sql]
-  (ResultSet. (create-resultset-seq sql (:queue @jdbc-state)) nil sql))
+  (ResultSet. (create-resultset-seq sql (:queue @jdbc-state)) false sql))
+
+(defn create-resultset-from-seq
+  "Return a resultset implementation from the given seq of vectors.
+  a string may be supplied for debug purposes which is stored in the
+  resultset sql field."
+  [s & [sql-string]]
+  (ResultSet. (cons nil s) false sql-string))
 
 (deftype Statement []
   java.sql.Statement
@@ -356,14 +370,187 @@
   (setPoolable [t flag])  ;; ignore
   (setQueryTimeout [t seconds]))
 
+(deftype ConnectionMetadata []
+  java.sql.DatabaseMetaData
+  (^boolean allProceduresAreCallable [_] false) ;; Retrieves whether the current user can call all the procedures returned by the method getProcedures.
+  (^boolean allTablesAreSelectable [_] false) ;; Retrieves whether the current user can use all the tables returned by the method getTables in a SELECT statement.
+  (^boolean autoCommitFailureClosesAllResultSets [_] false) ;; Retrieves whether a SQLException while autoCommit is true inidcates that all open ResultSets are closed, even ones that are holdable.
+  (^boolean dataDefinitionCausesTransactionCommit [_] false) ;; Retrieves whether a data definition statement within a transaction forces the transaction to commit.
+  (^boolean dataDefinitionIgnoredInTransactions [_] true) ;; Retrieves whether this database ignores a data definition statement within a transaction.
+  (^boolean deletesAreDetected [_ ^int type] false) ;; Retrieves whether or not a visible row delete can be detected by calling the method ResultSet.rowDeleted.
+  (^boolean doesMaxRowSizeIncludeBlobs [_] false) ;; Retrieves whether the return value for the method getMaxRowSize includes the SQL data types LONGVARCHAR and LONGVARBINARY.
+  (^java.sql.ResultSet getAttributes [_ ^String catalog, ^String schemaPattern, ^String typeNamePattern, ^String attributeNamePattern] (create-resultset-from-seq [])) ;; Retrieves a description of the given attribute of the given type for a userdefined type (UDT) that is available in the given schema and catalog.
+  (^java.sql.ResultSet getBestRowIdentifier [_ ^String catalog, ^String schema, ^String table, ^int scope, ^boolean nullable] (create-resultset-from-seq [])) ;; Retrieves a description of a table's optimal set of columns that uniquely identifies a row.
+  (^java.sql.ResultSet getCatalogs [_] (create-resultset-from-seq [])) ;; Retrieves the catalog names available in this database.
+  (^String getCatalogSeparator [_] ".") ;; Retrieves the String that this database uses as the separator between a catalog and table name.
+  (^String getCatalogTerm [_] "") ;; Retrieves the database vendor's preferred term for "catalog".
+  (^java.sql.ResultSet getClientInfoProperties [_] (create-resultset-from-seq [])) ;; Retrieves a list of the client info properties that the driver supports.
+  (^java.sql.ResultSet getColumnPrivileges [_ ^String catalog, ^String schema, ^String table, ^String columnNamePattern] (create-resultset-from-seq [])) ;; Retrieves a description of the access rights for a table's columns.
+  (^java.sql.ResultSet getColumns [_ ^String catalog, ^String schemaPattern, ^String tableNamePattern, ^String columnNamePattern] (create-resultset-from-seq [])) ;; Retrieves a description of table columns available in the specified catalog.
+  (^java.sql.Connection getConnection [_] (:connection @jdbc-state)) ;; Retrieves the connection that produced this metadata object.
+  (^java.sql.ResultSet getCrossReference [_ ^String parentCatalog, ^String parentSchema, ^String parentTable, ^String foreignCatalog, ^String foreignSchema, ^String foreignTable] (create-resultset-from-seq [])) ;; Retrieves a description of the foreign key columns in the given foreign key table that reference the primary key or the columns representing a unique constraint of the parent table (could be the same or a different table).
+  (^int getDatabaseMajorVersion [_] -1) ;; Retrieves the major version number of the underlying database.
+  (^int getDatabaseMinorVersion [_] -1) ;; Retrieves the minor version number of the underlying database.
+  (^String getDatabaseProductName [_] "mysql") ;; Retrieves the name of this database product.
+  (^String getDatabaseProductVersion [_] "0.1") ;; Retrieves the version number of this database product.
+  (^int getDefaultTransactionIsolation [_] java.sql.Connection/TRANSACTION_NONE) ;; Retrieves this database's default transaction isolation level.
+  (^int getDriverMajorVersion [_] 0) ;; Retrieves this JDBC driver's major version number.
+  (^int getDriverMinorVersion [_] 1) ;; Retrieves this JDBC driver's minor version number.
+  (^String getDriverName [_] "mysql binlog cdc jdbc interface") ;; Retrieves the name of this JDBC driver.
+  (^String getDriverVersion [_] "0.1") ;; Retrieves the version number of this JDBC driver as a String.
+  (^java.sql.ResultSet getExportedKeys [_ ^String catalog, ^String schema, ^String table] (create-resultset-from-seq [])) ;; Retrieves a description of the foreign key columns that reference the given table's primary key columns (the foreign keys exported by a table).
+  (^String getExtraNameCharacters [_] "") ;; Retrieves all the "extra" characters that can be used in unquoted identifier names (those beyond az, AZ, 09 and _).
+  (^java.sql.ResultSet getFunctionColumns [_ ^String catalog, ^String schemaPattern, ^String functionNamePattern, ^String columnNamePattern] (create-resultset-from-seq [])) ;; Retrieves a description of the given catalog's system or user function parameters and return type.
+  (^java.sql.ResultSet getFunctions [_ ^String catalog, ^String schemaPattern, ^String functionNamePattern] (create-resultset-from-seq [])) ;; Retrieves a description of the system and user functions available in the given catalog.
+  (^String getIdentifierQuoteString [_] "\"") ;; Retrieves the string used to quote SQL identifiers.
+  (^java.sql.ResultSet getImportedKeys [_ ^String catalog, ^String schema, ^String table] (create-resultset-from-seq [])) ;; Retrieves a description of the primary key columns that are referenced by the given table's foreign key columns (the primary keys imported by a table).
+  (^java.sql.ResultSet getIndexInfo [_ ^String catalog, ^String schema, ^String table, ^boolean unique, ^boolean approximate] (create-resultset-from-seq [])) ;; Retrieves a description of the given table's indices and statistics.
+  (^int getJDBCMajorVersion [_] -1) ;; Retrieves the major JDBC version number for this driver.
+  (^int getJDBCMinorVersion [_] -1) ;; Retrieves the minor JDBC version number for this driver.
+  (^int getMaxBinaryLiteralLength [_] -1) ;; Retrieves the maximum number of hex characters this database allows in an inline binary literal.
+  (^int getMaxCatalogNameLength [_] -1) ;; Retrieves the maximum number of characters that this database allows in a catalog name.
+  (^int getMaxCharLiteralLength [_] -1) ;; Retrieves the maximum number of characters this database allows for a character literal.
+  (^int getMaxColumnNameLength [_] -1) ;; Retrieves the maximum number of characters this database allows for a column name.
+  (^int getMaxColumnsInGroupBy [_] -1) ;; Retrieves the maximum number of columns this database allows in a GROUP BY clause.
+  (^int getMaxColumnsInIndex [_] -1) ;; Retrieves the maximum number of columns this database allows in an index.
+  (^int getMaxColumnsInOrderBy [_] -1) ;; Retrieves the maximum number of columns this database allows in an ORDER BY clause.
+  (^int getMaxColumnsInSelect [_] -1) ;; Retrieves the maximum number of columns this database allows in a SELECT list.
+  (^int getMaxColumnsInTable [_] -1) ;; Retrieves the maximum number of columns this database allows in a table.
+  (^int getMaxConnections [_] -1) ;; Retrieves the maximum number of concurrent connections to this database that are possible.
+  (^int getMaxCursorNameLength [_] -1) ;; Retrieves the maximum number of characters that this database allows in a cursor name.
+  (^int getMaxIndexLength [_] -1) ;; Retrieves the maximum number of bytes this database allows for an index, including all of the parts of the index.
+  (^int getMaxProcedureNameLength [_] -1) ;; Retrieves the maximum number of characters that this database allows in a procedure name.
+  (^int getMaxRowSize [_] -1) ;; Retrieves the maximum number of bytes this database allows in a single row.
+  (^int getMaxSchemaNameLength [_] -1) ;; Retrieves the maximum number of characters that this database allows in a schema name.
+  (^int getMaxStatementLength [_] -1) ;; Retrieves the maximum number of characters this database allows in an SQL statement.
+  (^int getMaxStatements [_] -1) ;; Retrieves the maximum number of active statements to this database that can be open at the same time.
+  (^int getMaxTableNameLength [_] -1) ;; Retrieves the maximum number of characters this database allows in a table name.
+  (^int getMaxTablesInSelect [_] -1) ;; Retrieves the maximum number of tables this database allows in a SELECT statement.
+  (^int getMaxUserNameLength [_] -1) ;; Retrieves the maximum number of characters this database allows in a user name.
+  (^String getNumericFunctions [_] -1) ;; Retrieves a commaseparated list of math functions available with this database.
+  (^java.sql.ResultSet getPrimaryKeys [_ ^String catalog, ^String schema, ^String table] (create-resultset-from-seq [])) ;; Retrieves a description of the given table's primary key columns.
+  (^java.sql.ResultSet getProcedureColumns [_ ^String catalog, ^String schemaPattern, ^String procedureNamePattern, ^String columnNamePattern] (create-resultset-from-seq [])) ;; Retrieves a description of the given catalog's stored procedure parameter and result columns.
+  (^java.sql.ResultSet getProcedures [_ ^String catalog, ^String schemaPattern, ^String procedureNamePattern] (create-resultset-from-seq [])) ;; Retrieves a description of the stored procedures available in the given catalog.
+  (^String getProcedureTerm [_] "procedure") ;; Retrieves the database vendor's preferred term for "procedure".
+  (^int getResultSetHoldability [_] java.sql.ResultSet/HOLD_CURSORS_OVER_COMMIT) ;; Retrieves this database's default holdability for ResultSet objects.
+  (^java.sql.RowIdLifetime getRowIdLifetime [_] java.sql.RowIdLifetime/ROWID_UNSUPPORTED) ;; Indicates whether or not this data source supports the SQL ROWID type, and if so the lifetime for which a RowId object remains valid.
+  (^java.sql.ResultSet getSchemas [_] (create-resultset-from-seq [])) ;; Retrieves the schema names available in this database.
+  (^java.sql.ResultSet getSchemas [_ ^String catalog, ^String schemaPattern] (create-resultset-from-seq [])) ;; Retrieves the schema names available in this database.
+  (^String getSchemaTerm [_] "schema") ;; Retrieves the database vendor's preferred term for "schema".
+  (^String getSearchStringEscape [_] "") ;; Retrieves the string that can be used to escape wildcard characters.
+  (^String getSQLKeywords [_] "") ;; Retrieves a commaseparated list of all of this database's SQL keywords that are NOT also SQL:2003 keywords.
+  (^int getSQLStateType [_] -1) ;; Indicates whether the SQLSTATE returned by SQLException.getSQLState is X/Open (now known as Open Group) SQL CLI or SQL:2003.
+  (^String getStringFunctions [_] "") ;; Retrieves a commaseparated list of string functions available with this database.
+  (^java.sql.ResultSet getSuperTables [_ ^String catalog, ^String schemaPattern, ^String tableNamePattern] (create-resultset-from-seq [])) ;; Retrieves a description of the table hierarchies defined in a particular schema in this database.
+  (^java.sql.ResultSet getSuperTypes [_ ^String catalog, ^String schemaPattern, ^String typeNamePattern] (create-resultset-from-seq [])) ;; Retrieves a description of the userdefined type (UDT) hierarchies defined in a particular schema in this database.
+  (^String getSystemFunctions [_] "") ;; Retrieves a commaseparated list of system functions available with this database.
+  (^java.sql.ResultSet getTablePrivileges [_ ^String catalog, ^String schemaPattern, ^String tableNamePattern] (create-resultset-from-seq [])) ;; Retrieves a description of the access rights for each table available in a catalog.
+  (^java.sql.ResultSet getTables [_ ^String catalog, ^String schemaPattern, ^String tableNamePattern, ^"[Ljava.lang.String;" types] (create-resultset-from-seq [])) ;;String[] ;; Retrieves a description of the tables available in the given catalog.
+  (^java.sql.ResultSet getTableTypes [_] (create-resultset-from-seq [])) ;; Retrieves the table types available in this database.
+  (^String getTimeDateFunctions [_] "") ;; Retrieves a commaseparated list of the time and date functions available with this database.
+  (^java.sql.ResultSet getTypeInfo [_] (create-resultset-from-seq [])) ;; Retrieves a description of all the data types supported by this database.
+  (^java.sql.ResultSet getUDTs [_ ^String catalog, ^String schemaPattern, ^String typeNamePattern, ^ints types] (create-resultset-from-seq [])) ;; Retrieves a description of the userdefined types (UDTs) defined in a particular schema.
+  (^String getURL [_] "") ;; Retrieves the URL for this DBMS.
+  (^String getUserName [_] "") ;; Retrieves the user name as known to this database.
+  (^java.sql.ResultSet getVersionColumns [_ ^String catalog, ^String schema, ^String table] (create-resultset-from-seq [])) ;; Retrieves a description of a table's columns that are automatically updated when any value in a row is updated.
+  (^boolean insertsAreDetected [_ ^int type] false) ;; Retrieves whether or not a visible row insert can be detected by calling the method ResultSet.rowInserted.
+  (^boolean isCatalogAtStart [_] false) ;; Retrieves whether a catalog appears at the start of a fully qualified table name.
+  (^boolean isReadOnly [_] true) ;; Retrieves whether this database is in readonly mode.
+  (^boolean locatorsUpdateCopy [_] false) ;; Indicates whether updates made to a LOB are made on a copy or directly to the LOB.
+  (^boolean nullPlusNonNullIsNull [_] false) ;; Retrieves whether this database supports concatenations between NULL and nonNULL values being NULL.
+  (^boolean nullsAreSortedAtEnd [_] false) ;; Retrieves whether NULL values are sorted at the end regardless of sort order.
+  (^boolean nullsAreSortedAtStart [_] false) ;; Retrieves whether NULL values are sorted at the start regardless of sort order.
+  (^boolean nullsAreSortedHigh [_] false) ;; Retrieves whether NULL values are sorted high.
+  (^boolean nullsAreSortedLow [_] false) ;; Retrieves whether NULL values are sorted low.
+  (^boolean othersDeletesAreVisible [_ ^int type] false) ;; Retrieves whether deletes made by others are visible.
+  (^boolean othersInsertsAreVisible [_ ^int type] false) ;; Retrieves whether inserts made by others are visible.
+  (^boolean othersUpdatesAreVisible [_ ^int type] false) ;; Retrieves whether updates made by others are visible.
+  (^boolean ownDeletesAreVisible [_ ^int type] false) ;; Retrieves whether a result set's own deletes are visible.
+  (^boolean ownInsertsAreVisible [_ ^int type] false) ;; Retrieves whether a result set's own inserts are visible.
+  (^boolean ownUpdatesAreVisible [_ ^int type] false) ;; Retrieves whether for the given type of ResultSet object, the result set's own updates are visible.
+  (^boolean storesLowerCaseIdentifiers [_] false) ;; Retrieves whether this database treats mixed case unquoted SQL identifiers as case insensitive and stores them in lower case.
+  (^boolean storesLowerCaseQuotedIdentifiers [_] false) ;; Retrieves whether this database treats mixed case quoted SQL identifiers as case insensitive and stores them in lower case.
+  (^boolean storesMixedCaseIdentifiers [_] false) ;; Retrieves whether this database treats mixed case unquoted SQL identifiers as case insensitive and stores them in mixed case.
+  (^boolean storesMixedCaseQuotedIdentifiers [_] false) ;; Retrieves whether this database treats mixed case quoted SQL identifiers as case insensitive and stores them in mixed case.
+  (^boolean storesUpperCaseIdentifiers [_] false) ;; Retrieves whether this database treats mixed case unquoted SQL identifiers as case insensitive and stores them in upper case.
+  (^boolean storesUpperCaseQuotedIdentifiers [_] false) ;; Retrieves whether this database treats mixed case quoted SQL identifiers as case insensitive and stores them in upper case.
+  (^boolean supportsAlterTableWithAddColumn [_] false) ;; Retrieves whether this database supports ALTER TABLE with add column.
+  (^boolean supportsAlterTableWithDropColumn [_] false) ;; Retrieves whether this database supports ALTER TABLE with drop column.
+  (^boolean supportsANSI92EntryLevelSQL [_] false) ;; Retrieves whether this database supports the ANSI92 entry level SQL grammar.
+  (^boolean supportsANSI92FullSQL [_] false) ;; Retrieves whether this database supports the ANSI92 full SQL grammar supported.
+  (^boolean supportsANSI92IntermediateSQL [_] false) ;; Retrieves whether this database supports the ANSI92 intermediate SQL grammar supported.
+  (^boolean supportsBatchUpdates [_] false) ;; Retrieves whether this database supports batch updates.
+  (^boolean supportsCatalogsInDataManipulation [_] false) ;; Retrieves whether a catalog name can be used in a data manipulation statement.
+  (^boolean supportsCatalogsInIndexDefinitions [_] false) ;; Retrieves whether a catalog name can be used in an index definition statement.
+  (^boolean supportsCatalogsInPrivilegeDefinitions [_] false) ;; Retrieves whether a catalog name can be used in a privilege definition statement.
+  (^boolean supportsCatalogsInProcedureCalls [_] false) ;; Retrieves whether a catalog name can be used in a procedure call statement.
+  (^boolean supportsCatalogsInTableDefinitions [_] false) ;; Retrieves whether a catalog name can be used in a table definition statement.
+  (^boolean supportsColumnAliasing [_] false) ;; Retrieves whether this database supports column aliasing.
+  (^boolean supportsConvert [_] false) ;; Retrieves whether this database supports the JDBC scalar function CONVERT for the conversion of one JDBC type to another.
+  (^boolean supportsConvert [_ ^int fromType, ^int toType] false) ;; Retrieves whether this database supports the JDBC scalar function CONVERT for conversions between the JDBC types fromType and toType.
+  (^boolean supportsCoreSQLGrammar [_] false) ;; Retrieves whether this database supports the ODBC Core SQL grammar.
+  (^boolean supportsCorrelatedSubqueries [_] false) ;; Retrieves whether this database supports correlated subqueries.
+  (^boolean supportsDataDefinitionAndDataManipulationTransactions [_] false) ;; Retrieves whether this database supports both data definition and data manipulation statements within a transaction.
+  (^boolean supportsDataManipulationTransactionsOnly [_] false) ;; Retrieves whether this database supports only data manipulation statements within a transaction.
+  (^boolean supportsDifferentTableCorrelationNames [_] false) ;; Retrieves whether, when table correlation names are supported, they are restricted to being different from the names of the tables.
+  (^boolean supportsExpressionsInOrderBy [_] false) ;; Retrieves whether this database supports expressions in ORDER BY lists.
+  (^boolean supportsExtendedSQLGrammar [_] false) ;; Retrieves whether this database supports the ODBC Extended SQL grammar.
+  (^boolean supportsFullOuterJoins [_] false) ;; Retrieves whether this database supports full nested outer joins.
+  (^boolean supportsGetGeneratedKeys [_] false) ;; Retrieves whether autogenerated keys can be retrieved after a statement has been executed
+  (^boolean supportsGroupBy [_] false) ;; Retrieves whether this database supports some form of GROUP BY clause.
+  (^boolean supportsGroupByBeyondSelect [_] false) ;; Retrieves whether this database supports using columns not included in the SELECT statement in a GROUP BY clause provided that all of the columns in the SELECT statement are included in the GROUP BY clause.
+  (^boolean supportsGroupByUnrelated [_] false) ;; Retrieves whether this database supports using a column that is not in the SELECT statement in a GROUP BY clause.
+  (^boolean supportsIntegrityEnhancementFacility [_] false) ;; Retrieves whether this database supports the SQL Integrity Enhancement Facility.
+  (^boolean supportsLikeEscapeClause [_] false) ;; Retrieves whether this database supports specifying a LIKE escape clause.
+  (^boolean supportsLimitedOuterJoins [_] false) ;; Retrieves whether this database provides limited support for outer joins.
+  (^boolean supportsMinimumSQLGrammar [_] false) ;; Retrieves whether this database supports the ODBC Minimum SQL grammar.
+  (^boolean supportsMixedCaseIdentifiers [_] false) ;; Retrieves whether this database treats mixed case unquoted SQL identifiers as case sensitive and as a result stores them in mixed case.
+  (^boolean supportsMixedCaseQuotedIdentifiers [_] false) ;; Retrieves whether this database treats mixed case quoted SQL identifiers as case sensitive and as a result stores them in mixed case.
+  (^boolean supportsMultipleOpenResults [_] false) ;; Retrieves whether it is possible to have multiple ResultSet objects returned from a CallableStatement object simultaneously.
+  (^boolean supportsMultipleResultSets [_] false) ;; Retrieves whether this database supports getting multiple ResultSet objects from a single call to the method execute.
+  (^boolean supportsMultipleTransactions [_] false) ;; Retrieves whether this database allows having multiple transactions open at once (on different connections).
+  (^boolean supportsNamedParameters [_] false) ;; Retrieves whether this database supports named parameters to callable statements.
+  (^boolean supportsNonNullableColumns [_] false) ;; Retrieves whether columns in this database may be defined as nonnullable.
+  (^boolean supportsOpenCursorsAcrossCommit [_] false) ;; Retrieves whether this database supports keeping cursors open across commits.
+  (^boolean supportsOpenCursorsAcrossRollback [_] false) ;; Retrieves whether this database supports keeping cursors open across rollbacks.
+  (^boolean supportsOpenStatementsAcrossCommit [_] false) ;; Retrieves whether this database supports keeping statements open across commits.
+  (^boolean supportsOpenStatementsAcrossRollback [_] false) ;; Retrieves whether this database supports keeping statements open across rollbacks.
+  (^boolean supportsOrderByUnrelated [_] false) ;; Retrieves whether this database supports using a column that is not in the SELECT statement in an ORDER BY clause.
+  (^boolean supportsOuterJoins [_] false) ;; Retrieves whether this database supports some form of outer join.
+  (^boolean supportsPositionedDelete [_] false) ;; Retrieves whether this database supports positioned DELETE statements.
+  (^boolean supportsPositionedUpdate [_] false) ;; Retrieves whether this database supports positioned UPDATE statements.
+  (^boolean supportsResultSetConcurrency [_ ^int type, ^int concurrency] false) ;; Retrieves whether this database supports the given concurrency type in combination with the given result set type.
+  (^boolean supportsResultSetHoldability [_ ^int holdability] false) ;; Retrieves whether this database supports the given result set holdability.
+  (^boolean supportsResultSetType [_ ^int type] false) ;; Retrieves whether this database supports the given result set type.
+  (^boolean supportsSavepoints [_] false) ;; Retrieves whether this database supports savepoints.
+  (^boolean supportsSchemasInDataManipulation [_] false) ;; Retrieves whether a schema name can be used in a data manipulation statement.
+  (^boolean supportsSchemasInIndexDefinitions [_] false) ;; Retrieves whether a schema name can be used in an index definition statement.
+  (^boolean supportsSchemasInPrivilegeDefinitions [_] false) ;; Retrieves whether a schema name can be used in a privilege definition statement.
+  (^boolean supportsSchemasInProcedureCalls [_] false) ;; Retrieves whether a schema name can be used in a procedure call statement.
+  (^boolean supportsSchemasInTableDefinitions [_] false) ;; Retrieves whether a schema name can be used in a table definition statement.
+  (^boolean supportsSelectForUpdate [_] false) ;; Retrieves whether this database supports SELECT FOR UPDATE statements.
+  (^boolean supportsStatementPooling [_] false) ;; Retrieves whether this database supports statement pooling.
+  (^boolean supportsStoredFunctionsUsingCallSyntax [_] false) ;; Retrieves whether this database supports invoking userdefined or vendor functions using the stored procedure escape syntax.
+  (^boolean supportsStoredProcedures [_] false) ;; Retrieves whether this database supports stored procedure calls that use the stored procedure escape syntax.
+  (^boolean supportsSubqueriesInComparisons [_] false) ;; Retrieves whether this database supports subqueries in comparison expressions.
+  (^boolean supportsSubqueriesInExists [_] false) ;; Retrieves whether this database supports subqueries in EXISTS expressions.
+  (^boolean supportsSubqueriesInIns [_] false) ;; Retrieves whether this database supports subqueries in IN expressions.
+  (^boolean supportsSubqueriesInQuantifieds [_] false) ;; Retrieves whether this database supports subqueries in quantified expressions.
+  (^boolean supportsTableCorrelationNames [_] false) ;; Retrieves whether this database supports table correlation names.
+  (^boolean supportsTransactionIsolationLevel [_ ^int level] false) ;; Retrieves whether this database supports the given transaction isolation level.
+  (^boolean supportsTransactions [_] false) ;; Retrieves whether this database supports transactions.
+  (^boolean supportsUnion [_] false) ;; Retrieves whether this database supports SQL UNION.
+  (^boolean supportsUnionAll [_] false) ;; Retrieves whether this database supports SQL UNION ALL.
+  (^boolean updatesAreDetected [_ ^int type] false) ;; Retrieves whether or not a visible row update can be detected by calling the method ResultSet.rowUpdated.
+  (^boolean usesLocalFilePerTable [_] false) ;; Retrieves whether this database uses a file for each table.
+  (^boolean usesLocalFiles [_] true)) ;; Retrieves whether this database stores tables in a local file.
+
 (deftype Connection [binlog-state]
   java.sql.Connection
   (close [_]
          (dosync (when-let [st (:statement @jdbc-state)] (.close st))
                  (alter jdbc-state assoc :closed true :connection nil)
-                 (send-off (:binlog-state @jdbc-state) binlog/cdc-stop))
-         ;;(when mysql-conn (.close mysql-conn))
-         )
+                 (send-off (:binlog-state @jdbc-state) binlog/cdc-stop)))
   (createStatement [t]
                    (dosync (if (:statement @jdbc-state)
                              (throwf "Close statement %s first" (:statement @jdbc-state))
@@ -372,7 +559,7 @@
                                s))))
   (createStatement [t rs-type rs-cncrcy])
   (createStatement [t rs-type rs-cncrcy rs-holdabilityb])
-  (getMetaData [t])
+  (getMetaData [t] (ConnectionMetadata.))
   java.sql.Wrapper
   (isWrapperFor [_ iface])
   (unwrap [_ iface]))
