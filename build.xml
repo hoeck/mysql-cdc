@@ -1,0 +1,58 @@
+<project name="cdc" default="all">
+  <description>Create a jar for the mysql CDC JDBC driver.</description>
+
+  <property name="build.dir" location="build" />
+  <property name="source.dir" location="src" />
+  <property name="libs.dir" location="lib" />
+  <property name="driver.jar" location="driver.jar" />
+
+  <path id="classpath">
+    <path location="${build.dir}" />
+    <path location="${source.dir}" />
+    <fileset dir="${libs.dir}">
+      <include name="*.jar" />
+    </fileset>
+  </path>
+  
+  <target name="clean" description="Remove generated files">
+    <delete file="${driver.jar}" />
+    <delete dir="${build.dir}" />
+  </target>
+
+  <target name="init" depends="clean">
+    <tstamp/>
+    <mkdir dir="${build.dir}" />
+  </target>
+
+  
+  <target name="compile" depends="compile-java, compile-clojure" />
+
+  <target name="compile-java" depends="init"
+          description="Compile Java sources.">
+    <javac srcdir="${source.dir}" destdir="${build.dir}" includeJavaRuntime="yes"
+           debug="true" target="1.5"/>
+  </target>
+
+  <target name="compile-clojure" depends="init"
+          description="Compile Clojure sources ahead of time">
+    <java classname="clojure.lang.Compile" fork="true">
+      <sysproperty key="clojure.compile.path" value="${build.dir}" />
+      <classpath refid="classpath" />
+      <arg value="cdc.mysql-binlog" />
+      <arg value="cdc.jdbc" />
+      <arg value="cdc.jdbc.CDCDriver" />
+    </java>
+  </target>
+
+  <target name="jar-all">
+    <jar jarfile="${driver.jar}" level="9">
+      <fileset dir="${build.dir}" includes="**/*.class" />
+      <zipfileset src="${libs.dir}/clojure.jar" excludes="META-INF/**/*, **/*.clj" />
+      <zipfileset src="${libs.dir}/clojure-contrib.jar" excludes="META-INF/**/*" />
+    </jar>
+  </target>
+
+  <target name="all" description="Create a jar file containing all compiled sources and clojure" depends="compile, jar-all" />
+
+</project>
+
