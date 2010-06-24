@@ -5,7 +5,7 @@
 ;;; by the database to the binlog file
 
 (ns cdc.mysql-binlog
-  (:use (clojure.contrib pprint except))
+  (:use [clojure.pprint :only [pprint]])
   (:import (java.io File FileInputStream)
            java.util.Arrays
            java.util.concurrent.LinkedBlockingQueue
@@ -19,6 +19,9 @@
            (net.contentobjects.jnotify JNotify
                                        JNotifyListener)
            cdc.mysql.Decimal))
+
+(defn throwf [& [format-string & args]]
+  (throw (Exception. (apply format (str "cdc.mysql-binlog: " format-string) args))))
 
 (def binlog-magic (->> [0xfe 0x62 0x69 0x6e] (map #(.byteValue %)) byte-array))
 
