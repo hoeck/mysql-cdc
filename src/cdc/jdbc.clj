@@ -2,7 +2,8 @@
 (ns cdc.jdbc
   (:use [clojure.pprint :only [pprint]])
   (:require [cdc.mysql-binlog :as binlog]
-            [clojure.contrib.sql.internal :as sql])
+            ;;[clojure.contrib.sql.internal :as sql]
+            )
   (:import (java.sql DriverManager
                      DriverPropertyInfo)
            (java.util Properties)
@@ -33,8 +34,8 @@
 (defn throwf-illegal [& args]
   (throw (IllegalArgumentException. (apply format (or args [""])))))
 
-(defn throwf [& args]
-  (throw (Exception. (apply format (or args [""])))))
+(defn throwf [& [format-string & args]]
+  (throw (Exception. (apply format (str "cdc.jdbc: " format-string) args))))
 
 (defn driver-property-info [& {n :name,
                                v :value,
@@ -78,7 +79,6 @@
   (isSigned [t c] true) ;; boolean; Indicates whether values in the designated column are signed numbers.
   (isWritable [t c] false)) ;; boolean; Indicates whether it is possible for a write on the designated column to succeed.
   
-
 (defn rows-delta-type
   "Return a fn that, given an event returns a seq of rows according to
   the quantifier."
@@ -163,7 +163,14 @@
     s))
 
 (defmacro getcol []
-  `(if-let [v# (nth (first ~'rows) ~'i)]
+  `(if-let [v# (nth (first ~'rows) (dec ~'i))]
+     (do (set! ~'was-null? false)
+         v#)
+     (do (set! ~'was-null? true)
+         nil)))
+
+(defmacro getcol-by-name []
+  `(if-let [v# (nth (first ~'rows) (.findColumn ~'t ~'c))]
      (do (set! ~'was-null? false)
          v#)
      (do (set! ~'was-null? true)
@@ -172,6 +179,7 @@
 ;; generic resultset implementation
 ;; please, single threaded access only!
 ;; mind the gap, nothing coordinated
+;; jdbc column numbering is 1<=colNum<=colCount!!!
 (deftype ResultSet [#^{:volatile-mutable true} rows ;; a set of vectors of columnvalues, starting with a nil
                     #^{:volatile-mutable true} was-null?
                     sql]
@@ -190,29 +198,31 @@
   (getMetaData [t]
                ;; generate resultset metadata using the first row
                (ResultSetMetaData. "" "" (second rows))) ;; ResultSetMetaData
-  (findColumn [t label]) ;; returns the colnumber
-  
+  (findColumn [t label]
+              ;; returns the colnumber from the colname,
+              ;; colnames are currently only printed numbers: "1", "2" ...
+              (Integer/valueOf label))
   ;; data getters
   (^String getString [t ^int i] (getcol))
-  (^String getString [t ^String c])
+  (^String getString [t ^String c] (getcol-by-name))
   (^boolean getBoolean [t ^int i])
   (^boolean getBoolean [t ^String c])
   (^byte getByte [t ^int i] (getcol))
-  (^byte getByte [t ^String c])
+  (^byte getByte [t ^String c] (getcol-by-name))
   (^short getShort [t ^int i] (getcol))
-  (^short getShort [t ^String c])
+  (^short getShort [t ^String c] (getcol-by-name))
   (^int getInt [t ^int i] (getcol))
-  (^int getInt [t ^String c])
-  (^long getLong [t ^int i]  (getcol))
-  (^long getLong [t ^String c])
-  (^float getFloat [t ^int i]  (getcol))
-  (^float getFloat [t ^String c])
-  (^double getDouble [t ^int i]  (getcol))
-  (^double getDouble [t ^String c])
-  (^BigDecimal getBigDecimal [t ^int i]  (getcol))
-  (^BigDecimal getBigDecimal [t ^String c])
-  (^BigDecimal getBigDecimal [t ^int i ^int scale])
-  (^BigDecimal getBigDecimal [t ^String c ^int scale])
+  (^int getInt [t ^String c] (getcol-by-name))
+  (^long getLong [t ^int i] (getcol))
+  (^long getLong [t ^String c] (getcol-by-name))
+  (^float getFloat [t ^int i] (getcol))
+  (^float getFloat [t ^String c] (getcol-by-name))
+  (^double getDouble [t ^int i] (getcol))
+  (^double getDouble [t ^String c] (getcol-by-name))
+  (^BigDecimal getBigDecimal [t ^int i] (getcol))
+  (^BigDecimal getBigDecimal [t ^String c] (getcol-by-name))
+  (^BigDecimal getBigDecimal [t ^int i ^int scale] (getcol))
+  (^BigDecimal getBigDecimal [t ^String c ^int scale] (getcol-by-name))
   (^bytes getBytes [t ^int i])
   (^bytes getBytes [t ^String c])
   (^java.sql.Date getDate [t ^int i])
@@ -233,8 +243,8 @@
   (^java.io.InputStream getUnicodeStream [t ^String c])
   (^java.io.InputStream getBinaryStream [t ^int i])
   (^java.io.InputStream getBinaryStream [t ^String c])
-  (getObject [t ^int i])
-  (getObject [t ^String c])
+  (getObject [t ^int i] (getcol))
+  (getObject [t ^String c] (getcol-by-name))
   (getObject [t ^int i ^java.util.Map m]) ;; get object with mapping
   (getObject [t ^String c ^java.util.Map m])
   (^java.io.Reader getCharacterStream [t ^int i])
@@ -330,7 +340,7 @@
   ;; misc, mostly unsupported or ignored
   (addBatch [t s] (throwf-unsupported))
   (executeBatch [t] (throwf-unsupported))
-  (cancel [t] (throwf-unsupported))
+  (cancel [t] (.close t))
   (clearBatch [t] (throwf-unsupported))
   (clearWarnings [t] (throwf-unsupported))
   (executeUpdate [t sql] (throwf-unsupported))
