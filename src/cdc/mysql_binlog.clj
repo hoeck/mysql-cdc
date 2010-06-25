@@ -1,3 +1,24 @@
+;; The MIT License
+;;
+;; Copyright (c) 2010 Erik Soehnel
+;;
+;; Permission is hereby granted, free of charge, to any person obtaining a copy
+;; of this software and associated documentation files (the "Software"), to deal
+;; in the Software without restriction, including without limitation the rights
+;; to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+;; copies of the Software, and to permit persons to whom the Software is
+;; furnished to do so, subject to the following conditions:
+;;
+;; The above copyright notice and this permission notice shall be included in
+;; all copies or substantial portions of the Software.
+;;
+;; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+;; IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+;; FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+;; AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+;; LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+;; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+;; THE SOFTWARE.
 
 ;;; functions to read the contents of a binary log, starting at offset x
 ;;;   `read-binlog'
@@ -588,6 +609,7 @@
         data))))
 
 (defn read-wud-rows [#^ByteBuffer b e table-map-event] ;; WRITE_ROWS_EVENT, DELETE_ROWS_EVENT, UPDATE_ROWS_EVENT
+  ;; entry from mysqlforge:
   ;; Write_rows_log_event/WRITE_ROWS_EVENT
   ;; Used for row-based binary logging beginning with MySQL 5.1.18.
   ;; [TODO: following needs verification; it's guesswork]
@@ -670,16 +692,6 @@
   ([#^ByteBuffer buf prev-evt]
      (lazy-seq (when-let [e (read-event-header buf (+ (:offset prev-evt) (:event-len prev-evt)))]
                  (cons e (all-events buf e))))))
-
-;; (defn further-decode-event [b e]
-;;   (case (:type e)
-;;         FORMAT_DESCRIPTION_EVENT (read-v4-format-description b e)
-;;         ROTATE_EVENT (read-rotate b e)
-;;         QUERY_EVENT (read-query-log b e)
-;;         XID_EVENT (read-xid b e)
-;;         TABLE_MAP_EVENT (read-table-map b e)
-;;         ;;[WRITE_ROWS_EVENT UPDATE_ROWS_EVENT DELETE_ROWS_EVENT] (read-wud-rows b e)
-;;         e))
 
 (defn with-open-binlog*
   "Try to open file-name and memory-map it to a ByteBuffer beginning at offset."
