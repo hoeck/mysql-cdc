@@ -1,0 +1,15 @@
+
+Log Based Change Data Capture for MySQL
+
+ * comes with a basic streaming-sql jdbc driver
+ * implemented in Clojure and Java
+ * supports only VARCHARs, INTs and DECIMALs
+ * uses the binary log (replication log) and the row based logging
+   format
+ * should work for any mysql version which supports row based logging
+
+Dependencies
+
+ * recent clojure snapshot
+ * JNotify
+
