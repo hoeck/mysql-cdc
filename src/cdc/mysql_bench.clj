@@ -20,13 +20,17 @@
 ;; OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 ;; THE SOFTWARE.
 
-(ns cdc.mysql
+;; functions for benchmarking specific mysql and cdc funcitonality
+
+(ns cdc.mysql-bench
   (:use [clojure.contrib.pprint :only [pprint]]
-        [clojure.contrib.except :only [throwf]])
+        [clojure.contrib.except :only [throwf]]
+        criterium.core)
   (:require [cdc.mysql-binlog :as binlog]
             [cdc.jdbc :as jdbc]
             [clojure.contrib.sql :as sql]
-            [clojure.contrib.sql.internal :as sql-i])
+            [clojure.contrib.sql.internal :as sql-i]
+            [clojure.contrib.io :as io])
   (:import (java.util.concurrent TimeUnit
                                  BlockingQueue
                                  LinkedBlockingQueue)
@@ -131,7 +135,10 @@ word varchar(50))")
   ;;(mysql-query "show master status")
   (-> (mysql-query "show binary logs") reverse second :log_name))
 
-(defn check-read-data [s]
+(defn check-read-data
+  "Given a seq of rows, test wether they are equal except
+  for the first element."
+  [s]
   (->> (filter #(= (:type %) 'UPDATE_ROWS_EVENT) s)
        (mapcat :rows)
        (map second)
@@ -140,23 +147,140 @@ word varchar(50))")
        (reduce #(and (= % %2) %))
        boolean))
 
+;;; benchmark mysql and read-binlog performance
 
-(comment
-
-  ;; setup
+(defn binlog-io-setup []
   (create-big-table)
   (grow-big-table 10)
-  (big-table-data-size)
-  
-  ;; mysql write test
-  (criterium (big-table-update) :verbose)
+  (big-table-data-size))
 
-  ;; read-binlog perf test
+(defn read-penultimate-binlog
+  []
   (->> (get-penultimate-binlog)
        (str "/var/log/mysql/" )
        (binlog/read-binlog)
        first
+       ;; do something with the data
        check-read-data))
+
+(comment
+  ;; == binlog io test ==
+  ;; compare the runtime of writing n megabytes to the binlog
+  ;; and reading those n megabytes from the binlog
+  ;; In /etc/mysql/my.cnf set:
+  ;;   max_binlog_size=1m
+  ;;   binlog_format=ROW
+  ;; and start the jvm with a reasonable amout of memory: java -server -Xmx256m -cp ...
+  ;; (1) create the test database
+  (binlog-io-setup)
+  ;; (2) benchmark the database
+  (with-progress-reporting (bench (big-table-update) :verbose))
+  ;; (3) benchmark the binlog parser
+  (with-progress-reporting (bench (read-penultimate-binlog) :verbose))
+  
+  )
+
+
+(def state (agent {}))
+
+(defn binlog2-results [{s :start-time, e :end-time c :counter :as ag} result-list-key]
+  (let [total-time (double (/ (double (- e s)) 1000000.0))]
+    (println (format "Total time for %s turns: %sms" @c total-time))
+    (update-in ag [result-list-key] #(if % (conj % %2) [%2]) total-time)))
+
+(defn binlog2 [s times]
+  ;;(reset! ping-start (System/nanoTime))
+  ;;(reset! latencies [])
+  ;;(when binlog-state (send-off binlog-state binlog/cdc-stop))
+  (create-big-table)
+  (let [ag *agent*
+        counter (atom 0)
+        bs (binlog/cdc-init (fn [_]
+                              (if (< (swap! counter inc) times)
+                                (big-table-update)
+                                (let [end-time (System/nanoTime)]
+                                  (send ag (fn [a]
+                                             (send-off (:binlog-state a) binlog/cdc-stop)
+                                             (assoc a :end-time end-time)))
+                                  (send ag binlog2-results :binlog2)))))]
+    (let [ret (assoc s
+                :start-time (System/nanoTime)
+                :binlog-state bs
+                :counter counter
+                :end-time 0)]
+      (send-off bs
+                (fn [a]
+                  (let [ret (binlog/cdc-start a "/var/log/mysql/binlog-files.index")]
+                    ;; start the benchmarking right after cdc has been started
+                    (send ag (fn [a]
+                               (let [s (System/nanoTime)]
+                                 (big-table-update)
+                                 (assoc a :start-time s))))
+                    ret)))
+      ret)))
+
+(defn binlog3 [s times]
+  (create-big-table)
+  (let [counter (atom 0)
+        ret (assoc s
+              :start-time (System/nanoTime)
+              :counter counter
+              :end-time 0)
+        step (fn step [a] (if (< (swap! counter inc) times)
+                            (do (big-table-update)
+                                (send *agent* step)
+                                a)
+                            (let [end-time (System/nanoTime)]
+                              (send *agent* binlog2-results)
+                              (assoc a :end-time end-time :binlog3))))]
+    (big-table-update)
+    (send *agent* step)
+    ret))
+
+(defn binlog4 [s times]
+  (let [counter (atom 0)
+        ret (assoc s
+              :start-time (System/nanoTime)
+              :counter counter
+              :end-time 0)
+        ms0 (first (mysql-query "show master status"))
+        ;; updating a single row generates 4 events:
+        ;; query - table-map - update-row - xid
+        _ (big-table-update)
+        start-pos (:position ms0)
+        logfile (str "/var/log/mysql/" (:file ms0))
+        step (fn step [a] (if (< (swap! counter inc) times)
+                            (if (= 4 (count (first (binlog/read-binlog logfile start-pos))))
+                              (do (send *agent* step)
+                                  a)
+                              (throwf "did not read 4 events!"))
+                            (let [end-time (System/nanoTime)]
+                              (send *agent* binlog2-results :binlog4)
+                              (assoc a :end-time end-time))))]
+    (send *agent* step)
+    ret))
+
+(defn binlog-clean-state [s]
+  (dissoc s :binlog-state :start-time :end-time :counter))
+
+(defn save-csv-data []
+  (io/spit "~/tmp/binlog-latency.csv"
+           (map
+            (fn [a b c] (str a "," b "," c "\n"))
+            (:binlog2 @state) (:binlog3 @state) (:binlog4 @state))))
+
+(comment
+  ;; == testing binlog latency performance ==
+  (send state binlog2 100) ;; cdc-full
+  (send state binlog3 100) ;; raw db updates
+  (send state binlog4 100) ;; plain reads
+  ;; latency = cdc-full - raw-db-updates - plain-reads
+  (binlog-clean-state)
+  
+  )
+
+
+
 
 
 
