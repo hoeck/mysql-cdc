@@ -710,7 +710,6 @@
   ([fname] (read-binlog fname 4))
   ([fname start-offset] (read-binlog fname start-offset nil))
   ([fname start-offset table-map-evt]
-     (println"with-open-binlog:" fname start-offset)
      (with-open-binlog* fname start-offset
        (fn [b]
          (loop [table-map-e table-map-evt
@@ -802,7 +801,7 @@
 
 ;;; the application, basically works but needs some cleanup here and there
 
-(defn cdc-init [event-fn]
+(defn cdc-init [& [event-fn]]
   "returns an agent containg the initial state"
   (agent {:watch-id nil
           :logname nil
@@ -948,15 +947,14 @@
   ;; init state with an event-callback:
   (def *state* (cdc-init #(.put #^BlockingQueue %)))
   ;; start the cdc-mechanism
-  (send-off *state* cdc-start "/var/log/mysql/binlog-files.index" )
+  (send-off *state* cdc-start "/var/log/mysql/binlog-files.index")
 
   ;; pop sql-events off the *queue* 
   (.poll *queue* 200 TimeUnit/MILLISECONDS)
   
   ;; stop it
   (send *state* cdc-stop)
-  
-   
+     
   ;; or read the binlog manually:
   (time
    (let [[events rot]
